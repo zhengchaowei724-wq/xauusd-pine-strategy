@@ -1,0 +1,219 @@
+//@version=6
+strategy(
+     title="XAUUSD Intraday Trend Pullback Strategy v6",
+     shorttitle="XAUUSD Intraday v6",
+     overlay=true,
+     initial_capital=100000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.02,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false
+)
+
+// =====================================================
+// 1) Inputs
+// =====================================================
+emaFastLen          = input.int(20,  "EMA Fast Length", minval=1)
+emaSlowLen          = input.int(50,  "EMA Slow Length", minval=2)
+rsiLen              = input.int(14,  "RSI Length", minval=2)
+rsiLongThreshold    = input.float(50.0, "RSI Long Threshold", step=0.1)
+rsiShortThreshold   = input.float(50.0, "RSI Short Threshold", step=0.1)
+atrLen              = input.int(14,  "ATR Length", minval=1)
+useMinVolFilter     = input.bool(true, "Enable Minimum Volatility Filter")
+minAtrThreshold     = input.float(1.2, "Minimum ATR Threshold", step=0.1)
+slAtrMult           = input.float(1.2, "Stop Loss ATR Multiplier", minval=0.1, step=0.1)
+tpRrMult            = input.float(2.0, "Take Profit R-Multiple", minval=0.5, step=0.1)
+useBreakeven        = input.bool(true, "Enable Breakeven at 1R")
+useTrailingStop     = input.bool(false, "Enable ATR Trailing Stop")
+trailAtrMult        = input.float(1.0, "Trailing Stop ATR Multiplier", minval=0.1, step=0.1)
+tradeSession        = input.session("0700-1700", "Trading Session (London + New York)")
+onlyOnCloseConfirm  = input.bool(true, "Only Enter on Bar Close Confirmation")
+
+// Extra quality/stability filters (to reduce chop and chasing)
+maxDistanceAtrMult  = input.float(0.8, "Max Distance From EMA20 (ATR Multiplier)", minval=0.1, step=0.1)
+maxBodyAtrMult      = input.float(1.0, "Max Candle Body Size (ATR Multiplier)", minval=0.1, step=0.1)
+chopAdxLen          = input.int(14, "ADX Length (Chop Filter)", minval=2)
+minAdxThreshold     = input.float(16.0, "Minimum ADX to Trade", minval=1.0, step=0.5)
+cooldownBars        = input.int(2, "Minimum Bars Between New Entries", minval=0)
+
+// =====================================================
+// 2) Core calculations
+// =====================================================
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+atrVal  = ta.atr(atrLen)
+atrAvg  = ta.sma(atrVal, 50)
+adxVal  = ta.adx(chopAdxLen)
+
+inSession = not na(time(timeframe.period, tradeSession))
+barConfirmed = onlyOnCloseConfirm ? barstate.isconfirmed : true
+
+isTrendLong  = emaFast > emaSlow
+isTrendShort = emaFast < emaSlow
+
+// Pullback + reclaim / rejection around EMA20
+pullbackLong = low <= emaFast and close > emaFast
+pullbackShort = high >= emaFast and close < emaFast
+
+// Momentum refresh logic (re-strengthening around threshold)
+rsiLongOk  = rsiVal > rsiLongThreshold and rsiVal > rsiVal[1]
+rsiShortOk = rsiVal < rsiShortThreshold and rsiVal < rsiVal[1]
+
+// Volatility filter: absolute minimum + relative average check
+volatilityOk = useMinVolFilter ? (atrVal >= minAtrThreshold and atrVal >= atrAvg * 0.70) : true
+
+// Avoid far-from-EMA chasing
+distanceFromEma = math.abs(close - emaFast)
+distanceOk = distanceFromEma <= atrVal * maxDistanceAtrMult
+
+// Avoid oversized impulse candles (do not chase large bars)
+bodySize = math.abs(close - open)
+bodyOk = bodySize <= atrVal * maxBodyAtrMult
+
+// Sideways/chop reduction
+trendStrengthOk = adxVal >= minAdxThreshold
+
+// Anti-whipsaw cooldown
+var int lastEntryBar = na
+cooldownOk = na(lastEntryBar) or (bar_index - lastEntryBar > cooldownBars)
+
+// Only one direction at a time
+noLongPosition  = strategy.position_size <= 0
+noShortPosition = strategy.position_size >= 0
+
+// Entry conditions
+longCondition = barConfirmed and inSession and isTrendLong and pullbackLong and rsiLongOk and volatilityOk and distanceOk and bodyOk and trendStrengthOk and noLongPosition and cooldownOk
+shortCondition = barConfirmed and inSession and isTrendShort and pullbackShort and rsiShortOk and volatilityOk and distanceOk and bodyOk and trendStrengthOk and noShortPosition and cooldownOk
+
+// =====================================================
+// 3) Entries
+// =====================================================
+if longCondition
+    strategy.entry("Long", strategy.long)
+    lastEntryBar := bar_index
+
+if shortCondition
+    strategy.entry("Short", strategy.short)
+    lastEntryBar := bar_index
+
+// =====================================================
+// 4) Risk model and exits (SL/TP/Breakeven/Trailing)
+// =====================================================
+var float longRiskAtEntry = na
+var float shortRiskAtEntry = na
+
+newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if newLong
+    longRiskAtEntry := atrVal * slAtrMult
+    shortRiskAtEntry := na
+
+if newShort
+    shortRiskAtEntry := atrVal * slAtrMult
+    longRiskAtEntry := na
+
+if strategy.position_size == 0
+    longRiskAtEntry := na
+    shortRiskAtEntry := na
+
+longEntryPrice = strategy.position_size > 0 ? strategy.position_avg_price : na
+shortEntryPrice = strategy.position_size < 0 ? strategy.position_avg_price : na
+
+// Build long exit prices
+longBaseStop = strategy.position_size > 0 and not na(longRiskAtEntry) ? longEntryPrice - longRiskAtEntry : na
+longTakeProfit = strategy.position_size > 0 and not na(longRiskAtEntry) ? longEntryPrice + longRiskAtEntry * tpRrMult : na
+longOneRReached = strategy.position_size > 0 and not na(longRiskAtEntry) ? high >= (longEntryPrice + longRiskAtEntry) : false
+longBreakevenStop = strategy.position_size > 0 and useBreakeven and longOneRReached ? longEntryPrice : na
+longTrailStop = strategy.position_size > 0 and useTrailingStop ? close - atrVal * trailAtrMult : na
+longFinalStop = longBaseStop
+if strategy.position_size > 0
+    if useBreakeven and not na(longBreakevenStop)
+        longFinalStop := math.max(longFinalStop, longBreakevenStop)
+    if useTrailingStop and not na(longTrailStop)
+        longFinalStop := math.max(longFinalStop, longTrailStop)
+
+// Build short exit prices
+shortBaseStop = strategy.position_size < 0 and not na(shortRiskAtEntry) ? shortEntryPrice + shortRiskAtEntry : na
+shortTakeProfit = strategy.position_size < 0 and not na(shortRiskAtEntry) ? shortEntryPrice - shortRiskAtEntry * tpRrMult : na
+shortOneRReached = strategy.position_size < 0 and not na(shortRiskAtEntry) ? low <= (shortEntryPrice - shortRiskAtEntry) : false
+shortBreakevenStop = strategy.position_size < 0 and useBreakeven and shortOneRReached ? shortEntryPrice : na
+shortTrailStop = strategy.position_size < 0 and useTrailingStop ? close + atrVal * trailAtrMult : na
+shortFinalStop = shortBaseStop
+if strategy.position_size < 0
+    if useBreakeven and not na(shortBreakevenStop)
+        shortFinalStop := math.min(shortFinalStop, shortBreakevenStop)
+    if useTrailingStop and not na(shortTrailStop)
+        shortFinalStop := math.min(shortFinalStop, shortTrailStop)
+
+// Execute exits using strategy.exit() for both directions
+if strategy.position_size > 0 and not na(longFinalStop) and not na(longTakeProfit)
+    strategy.exit("Long Exit", from_entry="Long", stop=longFinalStop, limit=longTakeProfit)
+
+if strategy.position_size < 0 and not na(shortFinalStop) and not na(shortTakeProfit)
+    strategy.exit("Short Exit", from_entry="Short", stop=shortFinalStop, limit=shortTakeProfit)
+
+// =====================================================
+// 5) Visuals (EMA, signals, risk lines, labels)
+// =====================================================
+plot(emaFast, "EMA20", color=color.new(color.yellow, 0), linewidth=2)
+plot(emaSlow, "EMA50", color=color.new(color.orange, 0), linewidth=2)
+
+plotshape(longCondition, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny, text="Long")
+plotshape(shortCondition, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="Short")
+
+plot(strategy.position_size > 0 ? longFinalStop : na, "Long Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size > 0 ? longTakeProfit : na, "Long Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortFinalStop : na, "Short Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortTakeProfit : na, "Short Take Profit", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+if newLong
+    label.new(bar_index, low, "Long Entry\nSL: " + str.tostring(longBaseStop, format.mintick) + "\nTP: " + str.tostring(longTakeProfit, format.mintick),
+     style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0), size=size.small)
+
+if newShort
+    label.new(bar_index, high, "Short Entry\nSL: " + str.tostring(shortBaseStop, format.mintick) + "\nTP: " + str.tostring(shortTakeProfit, format.mintick),
+     style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0), size=size.small)
+
+// =====================================================
+// 6) Alerts (entry + exit)
+// =====================================================
+longEntryMsg = "Symbol=" + syminfo.ticker + " | Direction=LONG | Entry=" + str.tostring(close, format.mintick) + " | SL=" + str.tostring(longBaseStop, format.mintick) + " | TP=" + str.tostring(longTakeProfit, format.mintick)
+shortEntryMsg = "Symbol=" + syminfo.ticker + " | Direction=SHORT | Entry=" + str.tostring(close, format.mintick) + " | SL=" + str.tostring(shortBaseStop, format.mintick) + " | TP=" + str.tostring(shortTakeProfit, format.mintick)
+
+if longCondition
+    alert(longEntryMsg, alert.freq_once_per_bar_close)
+if shortCondition
+    alert(shortEntryMsg, alert.freq_once_per_bar_close)
+
+longExitEvent = strategy.position_size[1] > 0 and strategy.position_size <= 0
+shortExitEvent = strategy.position_size[1] < 0 and strategy.position_size >= 0
+
+prevLongStop = longFinalStop[1]
+prevLongTp = longTakeProfit[1]
+prevShortStop = shortFinalStop[1]
+prevShortTp = shortTakeProfit[1]
+
+longExitMsg = "Symbol=" + syminfo.ticker + " | Direction=LONG EXIT | LastEntry=" + str.tostring(strategy.position_avg_price[1], format.mintick) + " | LastSL=" + str.tostring(prevLongStop, format.mintick) + " | LastTP=" + str.tostring(prevLongTp, format.mintick)
+shortExitMsg = "Symbol=" + syminfo.ticker + " | Direction=SHORT EXIT | LastEntry=" + str.tostring(strategy.position_avg_price[1], format.mintick) + " | LastSL=" + str.tostring(prevShortStop, format.mintick) + " | LastTP=" + str.tostring(prevShortTp, format.mintick)
+
+if longExitEvent
+    alert(longExitMsg, alert.freq_once_per_bar_close)
+if shortExitEvent
+    alert(shortExitMsg, alert.freq_once_per_bar_close)
+
+// alertcondition (for UI-created static alerts)
+alertcondition(longCondition, title="Long Entry Alert", message="XAUUSD Long entry signal triggered.")
+alertcondition(shortCondition, title="Short Entry Alert", message="XAUUSD Short entry signal triggered.")
+alertcondition(longExitEvent, title="Long Exit Alert", message="XAUUSD Long position exited (TP/SL/Trail).")
+alertcondition(shortExitEvent, title="Short Exit Alert", message="XAUUSD Short position exited (TP/SL/Trail).")
+
+// =====================================================
+// 7) Notes on repaint safety
+// - No request.security with lookahead on
+// - No future bar indexing
+// - Entry can be confirmed at bar close via onlyOnCloseConfirm
+// =====================================================
